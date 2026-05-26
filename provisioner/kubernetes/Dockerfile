@@ -16,6 +16,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/
         --init none \
         --no-confirm \
         --extra-conf "sandbox = false" \
+        --extra-conf "filter-syscalls = false" \
         --extra-conf "max-jobs = auto" \
         --extra-conf "cores = 0"
 
