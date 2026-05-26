@@ -26,7 +26,7 @@ FROM alpine:latest
 RUN apk add --no-cache \
     ca-certificates \
     openssh-client \
-    terraform \
+    wget \
     && rm -rf /var/cache/apk/*
 
 # Install OpenTofu (Terraform alternative used in the project)
