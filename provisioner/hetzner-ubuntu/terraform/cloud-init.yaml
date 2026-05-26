@@ -1,0 +1,78 @@
+#cloud-config
+ssh_authorized_keys:
+  - ${proxy_public_key}
+
+write_files:
+  # SSH private key for store access (builder -> store host)
+  - path: /root/.ssh/store_key
+    permissions: '0600'
+    content: |
+      ${indent(6, builder_store_private_key)}
+
+%{ if store_host_public_key != "" ~}
+  # Known hosts for store server
+  - path: /root/.ssh/known_hosts
+    permissions: '0644'
+    content: |
+      [${store_host}]:${store_host_ssh_port} ${store_host_public_key}
+%{ endif ~}
+
+  # SSH config for store access
+  - path: /root/.ssh/config
+    permissions: '0644'
+    content: |
+      Host nix-store
+        HostName ${store_host}
+        Port ${store_host_ssh_port}
+        User ${store_host_user}
+        IdentityFile /root/.ssh/store_key
+        StrictHostKeyChecking %{ if store_host_public_key != "" }yes%{ else }accept-new%{ endif }
+
+  # Nix configuration for SSH store
+  - path: /etc/nix/nix.new.conf
+    permissions: '0644'
+    content: |
+      # Use SSH store for remote /nix/store access
+      store = ssh-ng://${store_host_user}@${store_host}:${store_host_ssh_port}?ssh-key=/root/.ssh/store_key&trusted=true
+
+      # Build settings
+      max-jobs = auto
+      cores = 0
+
+runcmd:
+  # Ensure SSH directory has correct permissions
+  - mkdir -p /root/.ssh
+  - chmod 700 /root/.ssh
+  - chmod 600 /root/.ssh/store_key
+  - chown -R root:root /root/.ssh
+
+  # If store host key not provided, do initial SSH connection to accept host key
+%{ if store_host_public_key == "" ~}
+  - |
+    ssh -o StrictHostKeyChecking=accept-new -o BatchMode=yes -i /root/.ssh/store_key -p ${store_host_ssh_port} ${store_host_user}@${store_host} true || true
+%{ endif ~}
+  - |
+    echo "Installing Nix via Determinate Systems installer..."
+    curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
+
+  # Append custom config to nix.conf
+  - |
+    echo "" >> /etc/nix/nix.custom.conf
+    echo "# Custom configuration for SSH store" >> /etc/nix/nix.custom.conf
+    cat /etc/nix/nix.new.conf >> /etc/nix/nix.custom.conf
+
+  # Restart nix-daemon with new configuration
+  - systemctl restart nix-daemon
+
+  # Test store connectivity
+  - |
+    . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+    echo "Testing Nix store connectivity to ${store_host}..."
+    if nix store ping 2>&1; then
+      echo "Store connectivity test: SUCCESS"
+    else
+      echo "Store connectivity test: FAILED (check SSH key and store host configuration)"
+    fi
+
+  # Signal that cloud-init is complete
+  - touch /var/lib/cloud/instance/boot-finished-nix

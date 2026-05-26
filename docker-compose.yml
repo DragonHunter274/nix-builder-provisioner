@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  nix-builder-proxy:
+    build: .
+    image: nix-builder-provisioner:latest
+    container_name: nix-builder-proxy
+    restart: unless-stopped
+
+    ports:
+      - "2222:2222"
+
+    volumes:
+      # REQUIRED: Terraform configuration (read-only, allows updates without rebuild)
+      - ./terraform:/app/terraform:ro
+
+      # REQUIRED: Terraform state must be persistent (read-write)
+      - ./terraform/state:/app/terraform/state
+
+      # RECOMMENDED: Persistent proxy host key (prevents SSH warnings on restart)
+      - ./proxy_ssh_key:/app/proxy_ssh_key
+
+      # OPTION 1: Mount your SSH directory (contains keys and authorized_keys)
+      - ~/.ssh:/root/.ssh:ro
+
+      # OPTION 2: Mount individual files (uncomment and adjust paths)
+      # - ./builder_ssh_key:/root/.ssh/id_ed25519:ro
+      # - ./authorized_keys:/root/.ssh/authorized_keys:ro
+
+    environment:
+      # REQUIRED: Hetzner Cloud API token
+      HCLOUD_TOKEN: "${HCLOUD_TOKEN}"
+
+      # Builder SSH key (for connecting to provisioned builders)
+      # OPTION 1: Use mounted file
+      BUILDER_SSH_KEY: "/root/.ssh/id_ed25519"
+
+      # OPTION 2: Pass key data directly (uncomment to use)
+      # BUILDER_SSH_KEY_DATA: "${BUILDER_SSH_KEY_DATA}"
+
+      # Client authentication configuration
+      # OPTION 1: Use mounted authorized_keys file
+      AUTHORIZED_KEYS_FILE: "/root/.ssh/authorized_keys"
+
+      # OPTION 2: GitHub user keys (uncomment to use)
+      # GITHUB_SSH_KEYS: "your-github-username"
+
+      # OPTION 3: GitHub repository with authorized_keys (uncomment to use)
+      # GITHUB_AUTHORIZED_KEYS_REPO: "your-org/ssh-keys@main"
+      # GITHUB_AUTHORIZED_KEYS_PATH: "authorized_keys"
+      # GITHUB_TOKEN: "${GITHUB_TOKEN}"  # For private repos
+
+      # OPTION 4: Pass keys directly (uncomment to use)
+      # SSH_KEYS: "${SSH_KEYS}"
+
+      # Security: Require at least one authorized key
+      REQUIRE_AUTH: "true"
+
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2222"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    # Optional: Resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1'
+    #       memory: 512M
+    #     reservations:
+    #       cpus: '0.5'
+    #       memory: 256M
+
+    # Optional: Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# Optional: Create a dedicated network
+# networks:
+#   default:
+#     name: nix-builder-network

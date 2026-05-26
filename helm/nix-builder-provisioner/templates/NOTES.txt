@@ -1,0 +1,36 @@
+nix-builder-provisioner has been deployed.
+
+Provisioner: {{ .Values.provisioner }}
+
+{{- if eq .Values.provisioner "kubernetes" }}
+
+Builder Pods will be created in namespace: {{ .Values.kubernetes.buildersNamespace }}
+Builder image: {{ .Values.kubernetes.builderImage }}
+
+{{- if not .Values.kubernetes.builderImage }}
+⚠  WARNING: kubernetes.builderImage is not set. Builds will fail until it is configured.
+   Build the builder image: docker buildx build --platform linux/amd64,linux/arm64 \
+     -t <registry>/nix-builder:<tag> provisioner/kubernetes/
+{{- end }}
+{{- end }}
+
+{{- if has .Values.provisioner (list "hetzner-ubuntu" "hetzner-snapshot") }}
+{{- if not .Values.hetzner.token }}
+⚠  WARNING: hetzner.token is not set. Builds will fail until HCLOUD_TOKEN is provided.
+{{- end }}
+{{- end }}
+
+Proxy SSH endpoint:
+{{- if eq .Values.service.type "LoadBalancer" }}
+  Run: kubectl get svc {{ include "nix-builder-provisioner.fullname" . }} -n {{ .Release.Namespace }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+  Then: nix build --store ssh-ng://root@<EXTERNAL-IP>:{{ .Values.service.port }} nixpkgs#hello
+{{- else if eq .Values.service.type "NodePort" }}
+  Run: kubectl get svc {{ include "nix-builder-provisioner.fullname" . }} -n {{ .Release.Namespace }}
+{{- else }}
+  Run: kubectl port-forward svc/{{ include "nix-builder-provisioner.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }} -n {{ .Release.Namespace }}
+  Then: nix build --store ssh-ng://root@127.0.0.1:{{ .Values.service.port }} nixpkgs#hello
+{{- end }}
+
+On first start the proxy prints the builder_store_key.pub — add it to your store host's
+authorized_keys for the user {{ .Values.store.user }}:
+  kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "nix-builder-provisioner.fullname" . }} | grep -A1 "ADD THIS TO"

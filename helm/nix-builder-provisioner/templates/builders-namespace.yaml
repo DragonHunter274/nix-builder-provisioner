@@ -1,0 +1,9 @@
+{{- if and (eq .Values.provisioner "kubernetes") .Values.kubernetes.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.kubernetes.buildersNamespace }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/part-of: {{ include "nix-builder-provisioner.name" . }}
+{{- end }}

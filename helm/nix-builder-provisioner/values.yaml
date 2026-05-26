@@ -1,0 +1,93 @@
+image:
+  repository: ghcr.io/dragonhunter274/nix-builder-provisioner
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Which provisioner backend to use: "kubernetes", "hetzner-ubuntu", "hetzner-snapshot"
+provisioner: kubernetes
+
+# --- Store host (required for all provisioners) ---
+store:
+  host: ""              # IP or hostname of the Nix store (e.g. your Hydra server)
+  sshPort: 22
+  user: "nix-builder"
+  hostKey: ""           # SSH public key of the store host for known_hosts verification
+
+# --- Builder pool ---
+pool:
+  reuse: false
+  size: 5
+  destroyDelay: "30s"
+
+# --- Kubernetes provisioner ---
+kubernetes:
+  # Namespace where builder Pods are created (separate from the proxy namespace)
+  buildersNamespace: "nix-builders"
+  # Pre-built container image with Nix + sshd (see provisioner/kubernetes/Dockerfile)
+  builderImage: ""
+  cpuRequest: "2"
+  memoryRequest: "4Gi"
+  cpuLimit: "4"
+  memoryLimit: "8Gi"
+  imagePullSecret: ""
+  # Create the builders namespace and RBAC as part of this release
+  createNamespace: true
+  createRBAC: true
+
+# --- Hetzner provisioner (hetzner-ubuntu or hetzner-snapshot) ---
+hetzner:
+  # API token — set here for dev/testing; use existingSecret for production
+  token: ""
+  location: "hel1"
+  serverTypeArm: "cax31"
+  serverTypeX86: "cx33"
+  # Snapshot IDs (hetzner-snapshot provisioner only)
+  snapshotIdArm: ""
+  snapshotIdX86: ""
+
+# --- Client SSH authentication ---
+# Public keys allowed to connect to the proxy as Nix clients.
+# Each entry is a full authorized_keys line, e.g. "ssh-ed25519 AAAA... user@host"
+authorizedKeys: []
+
+# Reference an existing Secret instead of creating one.
+# Must contain keys: STORE_HOST, HCLOUD_TOKEN (if hetzner).
+# When set, hetzner.token and store.* values are ignored.
+existingSecret: ""
+
+# --- Persistence ---
+# SSH keys (proxy_ssh_key, builder_store_key) and metrics DB are written to the
+# working directory. Mount a PVC there so they survive Pod restarts.
+# If disabled, keys regenerate on every restart (clients will see host key changes).
+persistence:
+  enabled: true
+  size: 1Gi
+  storageClass: ""      # leave empty to use cluster default
+  existingClaim: ""     # reuse a pre-existing PVC
+
+# --- Proxy service ---
+service:
+  type: LoadBalancer
+  port: 2222
+  annotations: {}
+  # loadBalancerIP: ""  # pin a specific IP if your cloud provider supports it
+
+# --- ServiceAccount ---
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}       # use for cloud IAM (e.g. EKS IRSA, GKE Workload Identity)
+
+# --- Proxy Pod resources ---
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}

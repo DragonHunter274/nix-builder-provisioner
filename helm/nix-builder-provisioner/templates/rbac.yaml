@@ -1,0 +1,35 @@
+{{- if and (eq .Values.provisioner "kubernetes") .Values.kubernetes.createRBAC }}
+---
+# Role in the builders namespace — grants the proxy permission to manage builder Pods and Secrets
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "nix-builder-provisioner.fullname" . }}
+  namespace: {{ .Values.kubernetes.buildersNamespace }}
+  labels:
+    {{- include "nix-builder-provisioner.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "delete"]
+---
+# RoleBinding in the builders namespace — binds to the proxy's ServiceAccount (cross-namespace)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "nix-builder-provisioner.fullname" . }}
+  namespace: {{ .Values.kubernetes.buildersNamespace }}
+  labels:
+    {{- include "nix-builder-provisioner.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "nix-builder-provisioner.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: Role
+  name: {{ include "nix-builder-provisioner.fullname" . }}
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

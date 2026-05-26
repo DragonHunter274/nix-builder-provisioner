@@ -1,0 +1,11 @@
+apiVersion: v2
+name: nix-builder-provisioner
+description: SSH proxy that provisions ephemeral Nix builder Pods per BuildDerivation
+type: application
+version: 0.1.0
+appVersion: "latest"
+keywords:
+  - nix
+  - builder
+  - kubernetes
+home: https://github.com/DragonHunter274/nix-builder-provisioner-hetzner

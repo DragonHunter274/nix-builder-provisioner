@@ -1,0 +1,165 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "nix-builder-provisioner.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "nix-builder-provisioner.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  # Recreate avoids two instances provisioning builders simultaneously
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "nix-builder-provisioner.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        # Roll the deployment when the secret changes
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "nix-builder-provisioner.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "nix-builder-provisioner.serviceAccountName" . }}
+      # Keys and metrics DB are written to workingDir (/data) so they land on the PVC
+      {{- if .Values.persistence.enabled }}
+      initContainers:
+        - name: fix-permissions
+          image: busybox:latest
+          command: ["sh", "-c", "chmod 700 /data/.ssh 2>/dev/null || true; chown -R root:root /data"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      {{- end }}
+      containers:
+        - name: proxy
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          workingDir: /data
+          command: ["/app/nix-builder-provisioner"]
+          ports:
+            - name: ssh
+              containerPort: 2222
+              protocol: TCP
+          livenessProbe:
+            tcpSocket:
+              port: 2222
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 2222
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          env:
+            - name: PROVISIONER
+              value: {{ .Values.provisioner | quote }}
+            - name: STORE_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nix-builder-provisioner.secretName" . }}
+                  key: STORE_HOST
+            - name: STORE_HOST_SSH_PORT
+              value: {{ .Values.store.sshPort | quote }}
+            - name: STORE_HOST_USER
+              value: {{ .Values.store.user | quote }}
+            {{- if .Values.store.hostKey }}
+            - name: STORE_HOST_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nix-builder-provisioner.secretName" . }}
+                  key: STORE_HOST_KEY
+            {{- end }}
+            - name: BUILDER_REUSE
+              value: {{ .Values.pool.reuse | quote }}
+            - name: BUILDER_POOL_SIZE
+              value: {{ .Values.pool.size | quote }}
+            - name: BUILDER_DESTROY_DELAY
+              value: {{ .Values.pool.destroyDelay | quote }}
+            - name: AUTHORIZED_KEYS_FILE
+              value: "/data/authorized_keys"
+
+            {{- if eq .Values.provisioner "kubernetes" }}
+            - name: K8S_NAMESPACE
+              value: {{ .Values.kubernetes.buildersNamespace | quote }}
+            - name: K8S_BUILDER_IMAGE
+              value: {{ .Values.kubernetes.builderImage | quote }}
+            - name: K8S_CPU_REQUEST
+              value: {{ .Values.kubernetes.cpuRequest | quote }}
+            - name: K8S_MEMORY_REQUEST
+              value: {{ .Values.kubernetes.memoryRequest | quote }}
+            - name: K8S_CPU_LIMIT
+              value: {{ .Values.kubernetes.cpuLimit | quote }}
+            - name: K8S_MEMORY_LIMIT
+              value: {{ .Values.kubernetes.memoryLimit | quote }}
+            {{- if .Values.kubernetes.imagePullSecret }}
+            - name: K8S_IMAGE_PULL_SECRET
+              value: {{ .Values.kubernetes.imagePullSecret | quote }}
+            {{- end }}
+            {{- end }}
+
+            {{- if has .Values.provisioner (list "hetzner-ubuntu" "hetzner-snapshot") }}
+            - name: HCLOUD_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "nix-builder-provisioner.secretName" . }}
+                  key: HCLOUD_TOKEN
+            - name: HCLOUD_LOCATION
+              value: {{ .Values.hetzner.location | quote }}
+            - name: HCLOUD_SERVER_TYPE_ARM
+              value: {{ .Values.hetzner.serverTypeArm | quote }}
+            - name: HCLOUD_SERVER_TYPE_X86
+              value: {{ .Values.hetzner.serverTypeX86 | quote }}
+            {{- if eq .Values.provisioner "hetzner-snapshot" }}
+            - name: HCLOUD_SNAPSHOT_ID_ARM
+              value: {{ .Values.hetzner.snapshotIdArm | quote }}
+            - name: HCLOUD_SNAPSHOT_ID_X86
+              value: {{ .Values.hetzner.snapshotIdX86 | quote }}
+            {{- end }}
+            {{- end }}
+
+            - name: METRICS_DB
+              value: "/data/build_metrics.db"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: authorized-keys
+              mountPath: /data/authorized_keys
+              subPath: authorized_keys
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "nix-builder-provisioner.pvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: authorized-keys
+          configMap:
+            name: {{ include "nix-builder-provisioner.fullname" . }}-authorized-keys
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
