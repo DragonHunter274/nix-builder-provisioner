@@ -19,7 +19,6 @@ import (
 	"nix-builder-provisioner/metrics"
 	"nix-builder-provisioner/nixproto"
 	"nix-builder-provisioner/provisioner"
-	hetznersnapshot "nix-builder-provisioner/provisioner/hetzner-snapshot"
 	hetznerubuntu "nix-builder-provisioner/provisioner/hetzner-ubuntu"
 	kubernetesprov "nix-builder-provisioner/provisioner/kubernetes"
 
@@ -38,7 +37,7 @@ type Config struct {
 	BuilderReuse        bool
 	BuilderPoolSize     int
 	BuilderDestroyDelay time.Duration
-	Provisioner         string // "hetzner-ubuntu", "hetzner-snapshot", or "kubernetes"
+	Provisioner         string // "hetzner-ubuntu" or "kubernetes"
 
 	// Kubernetes provisioner settings
 	K8sNamespace       string
@@ -269,23 +268,6 @@ func createProvisioner(config *Config) provisioner.Provisioner {
 	switch config.Provisioner {
 	case "hetzner-ubuntu":
 		return hetznerubuntu.NewWithDir("provisioner/hetzner-ubuntu/terraform", hetznerubuntu.HetznerConfig{
-			ServerTypeByArch: map[string]string{
-				"aarch64": getEnvString("HCLOUD_SERVER_TYPE_ARM", "cax31"),
-				"x86_64":  getEnvString("HCLOUD_SERVER_TYPE_X86", "cx33"),
-			},
-			Location: os.Getenv("HCLOUD_LOCATION"),
-		})
-	case "hetzner-snapshot":
-		snapshotARM := os.Getenv("HCLOUD_SNAPSHOT_ID_ARM")
-		snapshotX86 := os.Getenv("HCLOUD_SNAPSHOT_ID_X86")
-		if snapshotARM == "" && snapshotX86 == "" {
-			log.Fatalf("At least one of HCLOUD_SNAPSHOT_ID_ARM or HCLOUD_SNAPSHOT_ID_X86 is required for hetzner-snapshot provisioner")
-		}
-		return hetznersnapshot.NewWithDir("provisioner/hetzner-snapshot/terraform", hetznersnapshot.HetznerConfig{
-			SnapshotIDByArch: map[string]string{
-				"aarch64": snapshotARM,
-				"x86_64":  snapshotX86,
-			},
 			ServerTypeByArch: map[string]string{
 				"aarch64": getEnvString("HCLOUD_SERVER_TYPE_ARM", "cax31"),
 				"x86_64":  getEnvString("HCLOUD_SERVER_TYPE_X86", "cx33"),
