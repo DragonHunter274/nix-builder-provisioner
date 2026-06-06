@@ -1,6 +1,6 @@
 image:
   repository: ghcr.io/dragonhunter274/nix-builder-provisioner
-  tag: latest
+  tag: master
   pullPolicy: IfNotPresent
 
 # Which provisioner backend to use: "kubernetes", "hetzner-ubuntu", "hetzner-snapshot"
@@ -91,3 +91,13 @@ podLabels: {}
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# --- NetworkPolicy ---
+# Enable when kube-router (or any network-policy enforcer) is in use.
+# Without this, traffic routed through the FORWARD chain (pod on a different
+# node than the MetalLB VIP) will be dropped by kube-router's default policy.
+networkPolicy:
+  enabled: false
+  # Restrict source IPs. Leave empty to allow all sources.
+  # e.g. ["10.2.0.0/16", "192.168.1.0/24"]
+  ingressCIDRs: []
