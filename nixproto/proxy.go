@@ -42,6 +42,12 @@ type ProxyConfig struct {
 
 	// Metrics is an optional recorder for build metrics
 	Metrics MetricsRecorder
+
+	// Signer, if set, signs build outputs and registers the signatures with the
+	// store host after each successful build. The store host must have the
+	// corresponding public key in nix.conf trusted-public-keys, and the
+	// StoreHostUser must be in trusted-users.
+	Signer *StoreSigner
 }
 
 // Proxy handles Nix daemon protocol connections and routes operations
@@ -589,6 +595,9 @@ func (p *Proxy) handleBuildDerivation(conn *Conn) error {
 		conn.StopWorkWithError(fmt.Sprintf("build failed: %v", err), 1)
 		return err
 	}
+
+	// Sign outputs and register signatures with the store (best-effort)
+	p.signAndRegisterOutputs(result)
 
 	// Record build metrics
 	if p.config.Metrics != nil {
@@ -1434,12 +1443,15 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		return conn.StopWorkWithError(fmt.Sprintf("writing AddMultipleToStore op: %v", err), 1)
 	}
 
-	// Forward repair and dontCheckSigs
-	// log.Printf("DEBUG: AddMultipleToStore: sending flags repair=%v dontCheckSigs=%v", repair, dontCheckSigs)
+	// Always enforce signature checking regardless of what the client requested.
+	// Clients cannot opt out of signature verification on the shared store.
+	if dontCheckSigs {
+		log.Printf("AddMultipleToStore: client requested dontCheckSigs=true, overriding to false")
+	}
 	if err := WriteBool(storeConn.Writer(), repair); err != nil {
 		return conn.StopWorkWithError(fmt.Sprintf("writing repair: %v", err), 1)
 	}
-	if err := WriteBool(storeConn.Writer(), dontCheckSigs); err != nil {
+	if err := WriteBool(storeConn.Writer(), false); err != nil {
 		return conn.StopWorkWithError(fmt.Sprintf("writing dontCheckSigs: %v", err), 1)
 	}
 
@@ -1756,6 +1768,209 @@ func (p *Proxy) handleQueryMissing(conn *Conn) error {
 	WriteUint64(conn.Writer(), 0)           // downloadSize
 	WriteUint64(conn.Writer(), 0)           // narSize
 	return nil
+}
+
+// signAndRegisterOutputs signs each output store path from a successful build and
+// registers the signatures with the store host via OpAddSignatures. Best-effort:
+// errors are logged but do not fail the build. Signatures are also added to
+// result.BuiltOutputs so the client sees them in the BuildResult.
+func (p *Proxy) signAndRegisterOutputs(result *BuildResult) {
+	if p.config.Signer == nil || p.config.StoreHostAddr == "" || p.config.StoreHostKey == nil {
+		return
+	}
+	switch result.Status {
+	case BuildResultBuilt, BuildResultSubstituted, BuildResultAlreadyValid:
+		// continue
+	default:
+		return
+	}
+
+	type entry struct {
+		id      string
+		outPath string
+	}
+	var outputs []entry
+	for id, real := range result.BuiltOutputs {
+		if real.OutPath != "" {
+			outputs = append(outputs, entry{id, real.OutPath})
+		}
+	}
+	if len(outputs) == 0 {
+		return
+	}
+
+	sshConfig := &ssh.ClientConfig{
+		User:            p.config.StoreHostUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(p.config.StoreHostKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         30 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", p.config.StoreHostAddr, sshConfig)
+	if err != nil {
+		log.Printf("signing: failed to connect to store host: %v", err)
+		return
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		log.Printf("signing: failed to create session: %v", err)
+		return
+	}
+	defer session.Close()
+
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		log.Printf("signing: failed to get stdin pipe: %v", err)
+		return
+	}
+	defer stdin.Close()
+
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		log.Printf("signing: failed to get stdout pipe: %v", err)
+		return
+	}
+
+	if err := session.Start("nix-daemon --stdio"); err != nil {
+		log.Printf("signing: failed to start nix-daemon: %v", err)
+		return
+	}
+
+	storeConn := NewConn(stdout, stdin)
+	if err := p.handshakeWithBuilder(storeConn); err != nil {
+		log.Printf("signing: store handshake failed: %v", err)
+		return
+	}
+	if err := p.sendSetOptions(storeConn, nil); err != nil {
+		log.Printf("signing: SetOptions failed: %v", err)
+		return
+	}
+
+	for _, out := range outputs {
+		pathInfo, err := p.queryPathInfoViaDaemon(storeConn, out.outPath)
+		if err != nil {
+			log.Printf("signing: QueryPathInfo failed for %s: %v", out.outPath, err)
+			continue
+		}
+		if pathInfo == nil {
+			log.Printf("signing: path not found on store: %s", out.outPath)
+			continue
+		}
+
+		sig, err := p.config.Signer.SignPath(out.outPath, pathInfo.NarHash, pathInfo.NarSize, pathInfo.References)
+		if err != nil {
+			log.Printf("signing: failed to sign %s: %v", out.outPath, err)
+			continue
+		}
+
+		if err := p.sendAddSignatures(storeConn, out.outPath, []string{sig}); err != nil {
+			log.Printf("signing: AddSignatures failed for %s (ensure %s is in trusted-users): %v",
+				out.outPath, p.config.StoreHostUser, err)
+			continue
+		}
+
+		real := result.BuiltOutputs[out.id]
+		real.Signatures = append(real.Signatures, sig)
+		result.BuiltOutputs[out.id] = real
+		log.Printf("signing: signed and registered %s", out.outPath)
+	}
+}
+
+// queryPathInfoViaDaemon queries the store host nix-daemon for path info on an
+// already-open connection. This is used during signing to get narHash, narSize,
+// and references needed to compute the Nix fingerprint.
+func (p *Proxy) queryPathInfoViaDaemon(storeConn *Conn, path string) (*PathInfo, error) {
+	if err := storeConn.WriteOp(OpQueryPathInfo); err != nil {
+		return nil, err
+	}
+	if err := WriteString(storeConn.Writer(), path); err != nil {
+		return nil, err
+	}
+	if err := storeConn.Flush(); err != nil {
+		return nil, err
+	}
+	if err := p.readStderrStream(storeConn, nil); err != nil {
+		return nil, err
+	}
+
+	minor := storeConn.Version & 0xff
+	if minor >= 17 {
+		found, err := ReadBool(storeConn.Reader())
+		if err != nil {
+			return nil, fmt.Errorf("reading found flag: %w", err)
+		}
+		if !found {
+			return nil, nil
+		}
+	}
+
+	deriver, err := ReadString(storeConn.Reader())
+	if err != nil {
+		return nil, fmt.Errorf("reading deriver: %w", err)
+	}
+	narHash, err := ReadString(storeConn.Reader())
+	if err != nil {
+		return nil, fmt.Errorf("reading narHash: %w", err)
+	}
+	refs, err := ReadStrings(storeConn.Reader())
+	if err != nil {
+		return nil, fmt.Errorf("reading refs: %w", err)
+	}
+	regTime, err := ReadUint64(storeConn.Reader())
+	if err != nil {
+		return nil, fmt.Errorf("reading regTime: %w", err)
+	}
+	narSize, err := ReadUint64(storeConn.Reader())
+	if err != nil {
+		return nil, fmt.Errorf("reading narSize: %w", err)
+	}
+
+	info := &PathInfo{
+		Deriver:          deriver,
+		NarHash:          narHash,
+		References:       refs,
+		RegistrationTime: regTime,
+		NarSize:          narSize,
+	}
+
+	if minor >= 16 {
+		ultimate, err := ReadBool(storeConn.Reader())
+		if err != nil {
+			return nil, fmt.Errorf("reading ultimate: %w", err)
+		}
+		sigs, err := ReadStrings(storeConn.Reader())
+		if err != nil {
+			return nil, fmt.Errorf("reading sigs: %w", err)
+		}
+		ca, err := ReadString(storeConn.Reader())
+		if err != nil {
+			return nil, fmt.Errorf("reading ca: %w", err)
+		}
+		info.Ultimate = ultimate
+		info.Sigs = sigs
+		info.CA = ca
+	}
+
+	return info, nil
+}
+
+// sendAddSignatures sends OpAddSignatures on an already-open store connection.
+// The store host must have the store user in trusted-users for this to succeed.
+func (p *Proxy) sendAddSignatures(storeConn *Conn, path string, sigs []string) error {
+	if err := storeConn.WriteOp(OpAddSignatures); err != nil {
+		return err
+	}
+	if err := WriteString(storeConn.Writer(), path); err != nil {
+		return err
+	}
+	if err := WriteStrings(storeConn.Writer(), sigs); err != nil {
+		return err
+	}
+	if err := storeConn.Flush(); err != nil {
+		return err
+	}
+	return p.readStderrStream(storeConn, nil)
 }
 
 // collectPeakMemory reads peak memory usage from a builder VM via SSH.

@@ -47,6 +47,10 @@ type Config struct {
 	K8sCPULimit        string
 	K8sMemoryLimit     string
 	K8sImagePullSecret string
+
+	// Signing
+	SigningKeyName string
+	Signer         *nixproto.StoreSigner
 }
 
 type SSHKeyPair struct {
@@ -205,6 +209,7 @@ func handleNixDaemon(channel ssh.Channel, pool *provisioner.Pool, config *Config
 		StoreHostUser: config.StoreHostUser,
 		StoreHostKey:  storeKey.Signer,
 		Metrics:       metricsDB,
+		Signer:        config.Signer,
 	}, pool)
 
 	if err := proxy.HandleConnectionWithContext(ctx, reader, channel); err != nil {
@@ -238,6 +243,8 @@ func LoadConfig() *Config {
 		K8sCPULimit:        getEnvString("K8S_CPU_LIMIT", "4"),
 		K8sMemoryLimit:     getEnvString("K8S_MEMORY_LIMIT", "8Gi"),
 		K8sImagePullSecret: os.Getenv("K8S_IMAGE_PULL_SECRET"),
+
+		SigningKeyName: getEnvString("SIGNING_KEY_NAME", "nix-builder-proxy-1"),
 	}
 }
 
@@ -310,6 +317,14 @@ func main() {
 	storeKey, _ := generateOrLoadKeyPair("builder_store_key", "nix-store-access")
 
 	log.Printf("=== ADD THIS TO STORE HOST AUTHORIZED_KEYS ===\n%s\n==============================================", string(storeKey.PublicKey))
+
+	signer, err := nixproto.GenerateOrLoadStoreSigner("store_signing_key", config.SigningKeyName)
+	if err != nil {
+		log.Printf("Warning: failed to initialize store signing key: %v (outputs will not be signed)", err)
+	} else {
+		config.Signer = signer
+		log.Printf("=== ADD TO STORE HOST nix.conf trusted-public-keys ===\n%s\n======================================================", signer.PublicKeyString())
+	}
 
 	// Create provisioner based on config
 	prov := createProvisioner(config)
