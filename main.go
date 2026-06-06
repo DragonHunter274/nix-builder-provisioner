@@ -95,7 +95,10 @@ func handleConnection(clientConn net.Conn, pool *provisioner.Pool, keysManager *
 	// Perform Handshake
 	serverConn, chans, reqs, err := ssh.NewServerConn(clientConn, sshConfig)
 	if err != nil {
-		log.Printf("SSH handshake failed: %v", err)
+		// Ignore EOF — happens on TCP health probes that connect and immediately close.
+		if err != io.EOF && !strings.Contains(err.Error(), "EOF") {
+			log.Printf("SSH handshake failed: %v", err)
+		}
 		return
 	}
 	defer serverConn.Close()
@@ -400,9 +403,13 @@ func (akm *AuthorizedKeysManager) IsAuthorized(key ssh.PublicKey) bool {
 }
 
 func NewAuthorizedKeysManager() *AuthorizedKeysManager {
+	keyFile := os.Getenv("AUTHORIZED_KEYS_FILE")
+	if keyFile == "" {
+		keyFile = os.ExpandEnv("$HOME/.ssh/authorized_keys")
+	}
 	akm := &AuthorizedKeysManager{
 		keys:    make(map[string]ssh.PublicKey),
-		keyFile: os.ExpandEnv("$HOME/.ssh/authorized_keys"),
+		keyFile: keyFile,
 	}
 	akm.reloadKeys()
 	go func() {
