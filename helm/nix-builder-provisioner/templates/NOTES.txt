@@ -31,6 +31,17 @@ Proxy SSH endpoint:
   Then: nix build --store ssh-ng://root@127.0.0.1:{{ .Values.service.port }} nixpkgs#hello
 {{- end }}
 
+{{- if .Values.ingress.enabled }}
+Web dashboard:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else }}
+Web dashboard (port-forward):
+  kubectl port-forward svc/{{ include "nix-builder-provisioner.fullname" . }} 8080:8080 -n {{ .Release.Namespace }}
+  Then open http://localhost:8080
+{{- end }}
+
 On first start the proxy prints the builder_store_key.pub — add it to your store host's
 authorized_keys for the user {{ .Values.store.user }}:
   kubectl logs -n {{ .Release.Namespace }} deployment/{{ include "nix-builder-provisioner.fullname" . }} | grep -A1 "ADD THIS TO"

@@ -241,6 +241,128 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// BuildRow is a single build record for API responses.
+type BuildRow struct {
+	ID           int64  `json:"id"`
+	DrvPath      string `json:"drvPath"`
+	PName        string `json:"pname"`
+	Version      string `json:"version"`
+	System       string `json:"system"`
+	BuilderID    string `json:"builderId"`
+	Status       uint64 `json:"status"`
+	StatusText   string `json:"statusText"`
+	ErrorMsg     string `json:"errorMsg,omitempty"`
+	StartTime    int64  `json:"startTime"`
+	StopTime     int64  `json:"stopTime"`
+	DurationSecs int64  `json:"durationSecs"`
+}
+
+// BuildList is the paginated response for ListBuilds.
+type BuildList struct {
+	Total  int64      `json:"total"`
+	Builds []BuildRow `json:"builds"`
+}
+
+// StoreSummary holds aggregate build statistics.
+type StoreSummary struct {
+	TotalBuilds      int64   `json:"totalBuilds"`
+	SuccessfulBuilds int64   `json:"successfulBuilds"`
+	FailedBuilds     int64   `json:"failedBuilds"`
+	AvgDurationSecs  float64 `json:"avgDurationSecs"`
+	P90DurationSecs  float64 `json:"p90DurationSecs"`
+}
+
+var buildStatusText = map[uint64]string{
+	0:  "built",
+	1:  "substituted",
+	2:  "already valid",
+	3:  "permanent failure",
+	4:  "input rejected",
+	5:  "output rejected",
+	6:  "transient failure",
+	7:  "cached failure",
+	8:  "timed out",
+	9:  "misc failure",
+	10: "dependency failed",
+	11: "log limit exceeded",
+	12: "not deterministic",
+	13: "resolves to already valid",
+	14: "no substituters",
+}
+
+// ListBuilds returns a paginated list of builds ordered newest first.
+func (s *Store) ListBuilds(limit, offset int) (*BuildList, error) {
+	var total int64
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM builds`).Scan(&total); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`
+		SELECT id, drv_path, pname, version, system, builder_id, status, error_msg, start_time, stop_time
+		FROM builds
+		ORDER BY id DESC
+		LIMIT ? OFFSET ?
+	`, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	builds := make([]BuildRow, 0)
+	for rows.Next() {
+		var b BuildRow
+		if err := rows.Scan(&b.ID, &b.DrvPath, &b.PName, &b.Version, &b.System,
+			&b.BuilderID, &b.Status, &b.ErrorMsg, &b.StartTime, &b.StopTime); err != nil {
+			return nil, err
+		}
+		if text, ok := buildStatusText[b.Status]; ok {
+			b.StatusText = text
+		} else {
+			b.StatusText = fmt.Sprintf("status(%d)", b.Status)
+		}
+		if b.StopTime > b.StartTime {
+			b.DurationSecs = b.StopTime - b.StartTime
+		}
+		builds = append(builds, b)
+	}
+	return &BuildList{Total: total, Builds: builds}, rows.Err()
+}
+
+// Summary returns aggregate statistics across all builds.
+func (s *Store) Summary() (*StoreSummary, error) {
+	var sum StoreSummary
+	err := s.db.QueryRow(`
+		SELECT
+			COUNT(*),
+			COUNT(*) FILTER (WHERE status IN (0,1,2,13)),
+			COUNT(*) FILTER (WHERE status NOT IN (0,1,2,13)),
+			COALESCE(AVG(stop_time - start_time) FILTER (WHERE status IN (0,1,2,13) AND stop_time > start_time), 0)
+		FROM builds
+	`).Scan(&sum.TotalBuilds, &sum.SuccessfulBuilds, &sum.FailedBuilds, &sum.AvgDurationSecs)
+	if err != nil {
+		return nil, err
+	}
+
+	err = s.db.QueryRow(`
+		SELECT COALESCE(stop_time - start_time, 0) AS duration
+		FROM builds
+		WHERE status IN (0,1,2,13) AND stop_time > start_time
+		ORDER BY duration ASC
+		LIMIT 1 OFFSET (
+			SELECT CAST(COUNT(*) * 0.9 AS INTEGER)
+			FROM builds
+			WHERE status IN (0,1,2,13) AND stop_time > start_time
+		)
+	`).Scan(&sum.P90DurationSecs)
+	if err == sql.ErrNoRows {
+		sum.P90DurationSecs = 0
+	} else if err != nil {
+		return nil, err
+	}
+
+	return &sum, nil
+}
+
 // ExtractPName extracts pname from a derivation's env map
 // Falls back to parsing the drv path basename
 func ExtractPName(env map[string]string, drvPath string) string {

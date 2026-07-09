@@ -23,4 +23,9 @@ spec:
             cidr: {{ . }}
         {{- end }}
       {{- end }}
+    {{- if .Values.ingress.enabled }}
+    - ports:
+        - protocol: TCP
+          port: 8080
+    {{- end }}
 {{- end }}

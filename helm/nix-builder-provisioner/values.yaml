@@ -65,6 +65,23 @@ persistence:
   storageClass: ""      # leave empty to use cluster default
   existingClaim: ""     # reuse a pre-existing PVC
 
+# --- Web dashboard ingress ---
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: nix-builder.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: nix-builder-tls
+  #    hosts:
+  #      - nix-builder.example.com
+
 # --- Proxy service ---
 service:
   type: LoadBalancer
