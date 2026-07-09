@@ -48,6 +48,18 @@ type ProxyConfig struct {
 	// corresponding public key in nix.conf trusted-public-keys, and the
 	// StoreHostUser must be in trusted-users.
 	Signer *StoreSigner
+
+	// Per-user input store settings. When UserStoreEnabled is true:
+	//   - AddMultipleToStore uploads land in a private store at
+	//     UserStoreRoot/<sanitized-fingerprint>/ on the store host.
+	//   - Before each BuildDerivation the private store's contents are
+	//     copied into the shared store (just-in-time), so builders can
+	//     access them normally. They are cleaned up by Nix's GC in due
+	//     course because they have no permanent GC root.
+	// Requires /nix/user-inputs/ (or UserStoreRoot) writable by StoreHostUser.
+	UserStoreEnabled   bool
+	UserFingerprint    string // SSH key fingerprint of the connected client
+	UserStoreRoot      string // Base dir on store host, e.g. /nix/user-inputs
 }
 
 // Proxy handles Nix daemon protocol connections and routes operations
@@ -587,6 +599,10 @@ func (p *Proxy) handleBuildDerivation(conn *Conn) error {
 	defer p.provider.ReleaseBuilder(builderID)
 
 	log.Printf("Got builder %s for derivation %s", builderID, drvPath)
+
+	// If per-user input stores are enabled, copy the user's private store paths
+	// into the shared store so the builder can access them.
+	p.importUserInputsToSharedStore()
 
 	// Connect to nix-daemon on the builder
 	result, err := p.executeBuildOnBuilder(builderSSH, conn, drvPath, drv, buildMode)
@@ -1420,7 +1436,17 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		}
 	}()
 
-	if err := session.Start("nix-daemon --stdio"); err != nil {
+	// Choose the nix-daemon command: shared store or user-private store.
+	nixDaemonCmd := "nix-daemon --stdio"
+	if p.config.UserStoreEnabled && p.config.UserFingerprint != "" {
+		storeRoot := p.userStoreRoot()
+		// Ensure the user store directory exists before starting the daemon.
+		nixDaemonCmd = fmt.Sprintf("mkdir -p %q && exec nix-daemon --stdio --store 'local?root=%s'",
+			storeRoot, storeRoot)
+		log.Printf("AddMultipleToStore: routing to user store at %s", storeRoot)
+	}
+
+	if err := session.Start(nixDaemonCmd); err != nil {
 		return conn.StopWorkWithError(fmt.Sprintf("failed to start nix-daemon: %v", err), 1)
 	}
 
@@ -1443,15 +1469,18 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		return conn.StopWorkWithError(fmt.Sprintf("writing AddMultipleToStore op: %v", err), 1)
 	}
 
-	// Always enforce signature checking regardless of what the client requested.
-	// Clients cannot opt out of signature verification on the shared store.
-	if dontCheckSigs {
+	// When uploading to the shared store: enforce sig checking regardless of what
+	// the client requested (clients cannot bypass signature verification).
+	// When uploading to a user-private store: allow unsigned paths (the user is
+	// uploading their own source inputs which are not signed).
+	allowUnsigned := p.config.UserStoreEnabled && p.config.UserFingerprint != ""
+	if dontCheckSigs && !allowUnsigned {
 		log.Printf("AddMultipleToStore: client requested dontCheckSigs=true, overriding to false")
 	}
 	if err := WriteBool(storeConn.Writer(), repair); err != nil {
 		return conn.StopWorkWithError(fmt.Sprintf("writing repair: %v", err), 1)
 	}
-	if err := WriteBool(storeConn.Writer(), false); err != nil {
+	if err := WriteBool(storeConn.Writer(), allowUnsigned); err != nil {
 		return conn.StopWorkWithError(fmt.Sprintf("writing dontCheckSigs: %v", err), 1)
 	}
 
@@ -1768,6 +1797,74 @@ func (p *Proxy) handleQueryMissing(conn *Conn) error {
 	WriteUint64(conn.Writer(), 0)           // downloadSize
 	WriteUint64(conn.Writer(), 0)           // narSize
 	return nil
+}
+
+// sanitizeFingerprint converts an SSH key fingerprint to a safe directory name.
+// "SHA256:abc+d/ef==" → "abc+d_ef"  (strips prefix, replaces /, removes =)
+func sanitizeFingerprint(fp string) string {
+	fp = strings.TrimPrefix(fp, "SHA256:")
+	fp = strings.NewReplacer("/", "_", "+", "-", "=", "").Replace(fp)
+	return fp
+}
+
+// userStoreRoot returns the per-user store root path on the store host.
+func (p *Proxy) userStoreRoot() string {
+	root := p.config.UserStoreRoot
+	if root == "" {
+		root = "/nix/user-inputs"
+	}
+	return root + "/" + sanitizeFingerprint(p.config.UserFingerprint)
+}
+
+// importUserInputsToSharedStore copies all paths from the user's private store
+// on the store host into the shared store so builder VMs can access them.
+// This is a best-effort operation; errors are only logged.
+func (p *Proxy) importUserInputsToSharedStore() {
+	if !p.config.UserStoreEnabled || p.config.UserFingerprint == "" {
+		return
+	}
+	if p.config.StoreHostAddr == "" || p.config.StoreHostKey == nil {
+		return
+	}
+
+	storeRoot := p.userStoreRoot()
+
+	sshCfg := &ssh.ClientConfig{
+		User:            p.config.StoreHostUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(p.config.StoreHostKey)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         30 * time.Second,
+	}
+	client, err := ssh.Dial("tcp", p.config.StoreHostAddr, sshCfg)
+	if err != nil {
+		log.Printf("importUserInputs: SSH connect failed: %v", err)
+		return
+	}
+	defer client.Close()
+
+	session, err := client.NewSession()
+	if err != nil {
+		log.Printf("importUserInputs: SSH session failed: %v", err)
+		return
+	}
+	defer session.Close()
+
+	// nix copy --all copies every path from the source store into the destination.
+	// --to daemon writes into the shared nix-daemon (default store).
+	// --no-check-sigs: user inputs are unsigned (they originate from the client).
+	cmd := fmt.Sprintf(
+		"test -d %q/nix/store && nix copy --no-check-sigs --all --from 'local?root=%s' --to daemon 2>&1 || true",
+		storeRoot, storeRoot,
+	)
+	out, err := session.CombinedOutput(cmd)
+	if err != nil {
+		log.Printf("importUserInputs: command failed: %v: %s", err, out)
+		return
+	}
+	if len(strings.TrimSpace(string(out))) > 0 {
+		log.Printf("importUserInputs: %s", strings.TrimSpace(string(out)))
+	}
+	log.Printf("importUserInputs: imported user inputs from %s", storeRoot)
 }
 
 // signAndRegisterOutputs signs each output store path from a successful build and

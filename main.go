@@ -51,6 +51,10 @@ type Config struct {
 	// Signing
 	SigningKeyName string
 	Signer         *nixproto.StoreSigner
+
+	// Per-user input stores (optional)
+	UserStoreEnabled bool
+	UserStoreRoot    string // base path on store host, default /nix/user-inputs
 }
 
 type SSHKeyPair struct {
@@ -78,11 +82,13 @@ type AuthorizedKeysManager struct {
 func handleConnection(clientConn net.Conn, pool *provisioner.Pool, keysManager *AuthorizedKeysManager, proxyKey *SSHKeyPair, config *Config, storeKey *SSHKeyPair, metricsDB *metrics.Store) {
 	defer clientConn.Close()
 
+	var userFingerprint string
 	sshConfig := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			if keysManager.IsAuthorized(key) {
+				userFingerprint = ssh.FingerprintSHA256(key)
 				log.Printf("SECURITY: Authorized connection from %s (key: %s)",
-					conn.RemoteAddr(), ssh.FingerprintSHA256(key))
+					conn.RemoteAddr(), userFingerprint)
 				return &ssh.Permissions{}, nil
 			}
 			log.Printf("SECURITY: Rejected connection from %s (key: %s)",
@@ -120,13 +126,13 @@ func handleConnection(clientConn net.Conn, pool *provisioner.Pool, keysManager *
 			continue
 		}
 
-		go handleSSHSession(channel, requests, pool, config, storeKey, metricsDB)
+		go handleSSHSession(channel, requests, pool, config, storeKey, metricsDB, userFingerprint)
 	}
 }
 
 // handleSSHSession handles an SSH session channel
 // We look for "exec" requests running "nix-daemon --stdio" and intercept those
-func handleSSHSession(channel ssh.Channel, requests <-chan *ssh.Request, pool *provisioner.Pool, config *Config, storeKey *SSHKeyPair, metricsDB *metrics.Store) {
+func handleSSHSession(channel ssh.Channel, requests <-chan *ssh.Request, pool *provisioner.Pool, config *Config, storeKey *SSHKeyPair, metricsDB *metrics.Store, userFingerprint string) {
 	defer channel.Close()
 
 	for req := range requests {
@@ -149,7 +155,7 @@ func handleSSHSession(channel ssh.Channel, requests <-chan *ssh.Request, pool *p
 			// Check if this is nix-daemon --stdio
 			if strings.Contains(cmd, "nix-daemon") && strings.Contains(cmd, "--stdio") {
 				req.Reply(true, nil)
-				handleNixDaemon(channel, pool, config, storeKey, metricsDB)
+				handleNixDaemon(channel, pool, config, storeKey, metricsDB, userFingerprint)
 				// Send exit status
 				channel.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 				return
@@ -196,7 +202,7 @@ func (c *cancelOnCloseReader) Read(p []byte) (n int, err error) {
 
 // handleNixDaemon handles a nix-daemon --stdio session
 // This is where we intercept the Nix protocol and route BuildDerivation to VMs
-func handleNixDaemon(channel ssh.Channel, pool *provisioner.Pool, config *Config, storeKey *SSHKeyPair, metricsDB *metrics.Store) {
+func handleNixDaemon(channel ssh.Channel, pool *provisioner.Pool, config *Config, storeKey *SSHKeyPair, metricsDB *metrics.Store, userFingerprint string) {
 	log.Printf("Starting Nix daemon protocol handler")
 
 	// Create a context that gets cancelled when the channel closes/errors
@@ -213,6 +219,9 @@ func handleNixDaemon(channel ssh.Channel, pool *provisioner.Pool, config *Config
 		StoreHostKey:  storeKey.Signer,
 		Metrics:       metricsDB,
 		Signer:        config.Signer,
+		UserStoreEnabled: config.UserStoreEnabled,
+		UserFingerprint:  userFingerprint,
+		UserStoreRoot:    config.UserStoreRoot,
 	}, pool)
 
 	if err := proxy.HandleConnectionWithContext(ctx, reader, channel); err != nil {
@@ -248,6 +257,9 @@ func LoadConfig() *Config {
 		K8sImagePullSecret: os.Getenv("K8S_IMAGE_PULL_SECRET"),
 
 		SigningKeyName: getEnvString("SIGNING_KEY_NAME", "nix-builder-proxy-1"),
+
+		UserStoreEnabled: os.Getenv("USER_INPUT_STORES") == "true",
+		UserStoreRoot:    getEnvString("USER_STORE_ROOT", "/nix/user-inputs"),
 	}
 }
 
