@@ -11,10 +11,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy all source packages
-COPY main.go ./
+COPY main.go webui.go ./
 COPY metrics/ ./metrics/
 COPY nixproto/ ./nixproto/
 COPY provisioner/ ./provisioner/
+COPY webui/dist/ ./webui/dist/
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o nix-builder-provisioner .
