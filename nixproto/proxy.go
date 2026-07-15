@@ -1388,6 +1388,19 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 
 	log.Printf("AddMultipleToStore: forwarding to store host %s", p.config.StoreHostAddr)
 
+	// From this point on, the client has committed to streaming a
+	// FramedSource next regardless of what happens here. Any early return
+	// MUST drain that data first (see discardFramedSourceBody), or the
+	// leftover bytes desync the rest of the session.
+	failWithDrain := func(format string, args ...any) error {
+		msg := fmt.Sprintf(format, args...)
+		log.Printf("AddMultipleToStore: %s", msg)
+		if drainErr := p.discardFramedSourceBody(conn); drainErr != nil {
+			log.Printf("AddMultipleToStore: failed to drain client framed source after error: %v", drainErr)
+		}
+		return conn.StopWorkWithError(msg, 1)
+	}
+
 	// Connect to Store Host via SSH
 	sshConfig := &ssh.ClientConfig{
 		User:            p.config.StoreHostUser,
@@ -1398,34 +1411,32 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 
 	client, err := ssh.Dial("tcp", p.config.StoreHostAddr, sshConfig)
 	if err != nil {
-		log.Printf("AddMultipleToStore: failed to connect to Store Host: %v", err)
-		return conn.StopWorkWithError(fmt.Sprintf("failed to connect to Store Host: %v", err), 1)
+		return failWithDrain("failed to connect to Store Host: %v", err)
 	}
 	defer client.Close()
 
 	// Start session to run nix-daemon --stdio
 	session, err := client.NewSession()
 	if err != nil {
-		log.Printf("AddMultipleToStore: failed to create SSH session: %v", err)
-		return conn.StopWorkWithError(fmt.Sprintf("failed to create SSH session: %v", err), 1)
+		return failWithDrain("failed to create SSH session: %v", err)
 	}
 	defer session.Close()
 
 	stdin, err := session.StdinPipe()
 	if err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("failed to get stdin pipe: %v", err), 1)
+		return failWithDrain("failed to get stdin pipe: %v", err)
 	}
 	// Ensure stdin is closed when we're done to signal nix-daemon to exit
 	defer stdin.Close()
 
 	stdout, err := session.StdoutPipe()
 	if err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("failed to get stdout pipe: %v", err), 1)
+		return failWithDrain("failed to get stdout pipe: %v", err)
 	}
 
 	stderr, err := session.StderrPipe()
 	if err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("failed to get stderr pipe: %v", err), 1)
+		return failWithDrain("failed to get stderr pipe: %v", err)
 	}
 
 	// Capture stderr in background
@@ -1447,7 +1458,7 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 	}
 
 	if err := session.Start(nixDaemonCmd); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("failed to start nix-daemon: %v", err), 1)
+		return failWithDrain("failed to start nix-daemon: %v", err)
 	}
 
 	// Create connection to store host's nix-daemon
@@ -1455,18 +1466,18 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 
 	// Perform handshake with store host
 	if err := p.handshakeWithBuilder(storeConn); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("store host handshake failed: %v", err), 1)
+		return failWithDrain("store host handshake failed: %v", err)
 	}
 
 	// Send SetOptions first
 	if err := p.sendSetOptions(storeConn, nil); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("store host SetOptions failed: %v", err), 1)
+		return failWithDrain("store host SetOptions failed: %v", err)
 	}
 
 	// Now send AddMultipleToStore operation
 	// log.Printf("DEBUG: AddMultipleToStore: sending op to store host")
 	if err := storeConn.WriteOp(OpAddMultipleToStore); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("writing AddMultipleToStore op: %v", err), 1)
+		return failWithDrain("writing AddMultipleToStore op: %v", err)
 	}
 
 	// When uploading to the shared store: enforce sig checking regardless of what
@@ -1478,15 +1489,15 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		log.Printf("AddMultipleToStore: client requested dontCheckSigs=true, overriding to false")
 	}
 	if err := WriteBool(storeConn.Writer(), repair); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("writing repair: %v", err), 1)
+		return failWithDrain("writing repair: %v", err)
 	}
 	if err := WriteBool(storeConn.Writer(), allowUnsigned); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("writing dontCheckSigs: %v", err), 1)
+		return failWithDrain("writing dontCheckSigs: %v", err)
 	}
 
 	// Flush operation and flags before starting to forward data
 	if err := storeConn.Flush(); err != nil {
-		return conn.StopWorkWithError(fmt.Sprintf("flushing op and flags: %v", err), 1)
+		return failWithDrain("flushing op and flags: %v", err)
 	}
 
 	// Start reading stderr stream concurrently to prevent deadlock
@@ -1499,6 +1510,29 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		readErrCh <- err
 	}()
 
+	// failMidUpload reports a failure that happens once we're already
+	// forwarding frames. remainingCurrentFrame is how many bytes of the
+	// frame in progress the client has not yet sent us (0 if we're at a
+	// frame boundary); we must drain those plus every subsequent frame
+	// before replying, or the client's still-incoming bytes get misread as
+	// the next operation's opcode. Read-side failures on conn itself (the
+	// client connection breaking mid-frame) are the one case where there's
+	// nothing reliable left to drain, so those stay as bare errors below.
+	failMidUpload := func(remainingCurrentFrame uint64, format string, args ...any) error {
+		msg := fmt.Sprintf(format, args...)
+		log.Printf("AddMultipleToStore: %s", msg)
+		if remainingCurrentFrame > 0 {
+			if err := discardRawBytes(conn.Reader(), remainingCurrentFrame); err != nil {
+				log.Printf("AddMultipleToStore: failed to drain remainder of current frame: %v", err)
+				return conn.StopWorkWithError(msg, 1)
+			}
+		}
+		if err := p.discardFramedSourceBody(conn); err != nil {
+			log.Printf("AddMultipleToStore: failed to drain remaining framed source: %v", err)
+		}
+		return conn.StopWorkWithError(msg, 1)
+	}
+
 	// Forward the framed source data
 	totalBytes := uint64(0)
 	totalFrameBytes := uint64(0) // includes frame length headers
@@ -1509,7 +1543,7 @@ uploadLoop:
 		select {
 		case err := <-readErrCh:
 			if err != nil {
-				return fmt.Errorf("store host returned error during upload: %w", err)
+				return failMidUpload(0, "store host returned error during upload: %v", err)
 			}
 			// If nil, it means StderrLast was received early? That shouldn't happen during upload normally.
 			break uploadLoop
@@ -1527,7 +1561,7 @@ uploadLoop:
 
 		// Write frame length to store host
 		if err := WriteUint64(storeConn.Writer(), frameLen); err != nil {
-			return fmt.Errorf("writing frame length to store: %w", err)
+			return failMidUpload(frameLen, "writing frame length to store: %v", err)
 		}
 
 		if frameLen == 0 {
@@ -1550,7 +1584,7 @@ uploadLoop:
 			}
 			// Forward to store host
 			if _, err := storeConn.Writer().Write(buf[:n]); err != nil {
-				return fmt.Errorf("writing frame data to store: %w", err)
+				return failMidUpload(toRead-n, "writing frame data to store: %v", err)
 			}
 			toRead -= n
 		}
@@ -1599,8 +1633,31 @@ waitLoop:
 	return nil
 }
 
-// consumeAndDiscardFramedSource reads and discards framed source data
-func (p *Proxy) consumeAndDiscardFramedSource(conn *Conn) error {
+// discardRawBytes reads and discards exactly n unframed, unpadded bytes.
+func discardRawBytes(r io.Reader, n uint64) error {
+	buf := make([]byte, 32*1024)
+	for n > 0 {
+		chunk := n
+		if chunk > uint64(len(buf)) {
+			chunk = uint64(len(buf))
+		}
+		if _, err := io.ReadFull(r, buf[:chunk]); err != nil {
+			return err
+		}
+		n -= chunk
+	}
+	return nil
+}
+
+// discardFramedSourceBody reads and discards a client's FramedSource payload
+// (the sequence of length-prefixed chunks terminated by a zero-length frame)
+// without sending any reply. Once a client has sent an op that carries a
+// FramedSource (e.g. AddMultipleToStore), it unconditionally starts
+// streaming that data next - regardless of whether we can actually forward
+// it anywhere. Any error path taken before that data is fully read MUST
+// drain it here first, or the leftover bytes get misread as the next
+// operation's opcode, corrupting the rest of the session.
+func (p *Proxy) discardFramedSourceBody(conn *Conn) error {
 	totalBytes := uint64(0)
 	for {
 		frameLen, err := ReadUint64(conn.Reader())
@@ -1610,26 +1667,23 @@ func (p *Proxy) consumeAndDiscardFramedSource(conn *Conn) error {
 		if frameLen == 0 {
 			break
 		}
-
-		// FramedSource chunks are NOT padded
-		toRead := frameLen
 		totalBytes += frameLen
-
-		buf := make([]byte, 8192)
-		for toRead > 0 {
-			n := toRead
-			if n > uint64(len(buf)) {
-				n = uint64(len(buf))
-			}
-			_, err := io.ReadFull(conn.Reader(), buf[:n])
-			if err != nil {
-				return fmt.Errorf("reading frame data: %w", err)
-			}
-			toRead -= n
+		if err := discardRawBytes(conn.Reader(), frameLen); err != nil {
+			return fmt.Errorf("reading frame data: %w", err)
 		}
 	}
 
-	log.Printf("AddMultipleToStore: consumed %d bytes (discarded)", totalBytes)
+	log.Printf("AddMultipleToStore: discarded %d bytes of framed source", totalBytes)
+	return nil
+}
+
+// consumeAndDiscardFramedSource reads and discards framed source data, then
+// reports success to the client (used when we deliberately have nowhere to
+// forward the data, e.g. no Store Host configured).
+func (p *Proxy) consumeAndDiscardFramedSource(conn *Conn) error {
+	if err := p.discardFramedSourceBody(conn); err != nil {
+		return err
+	}
 	return conn.StopWork()
 }
 
