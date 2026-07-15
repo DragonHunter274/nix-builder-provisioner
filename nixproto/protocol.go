@@ -173,11 +173,23 @@ func WriteBool(w io.Writer, v bool) error {
 	return WriteUint64(w, val)
 }
 
+// maxReadBytesLength caps the allocation ReadBytes will attempt for a single
+// length-prefixed field. Nix's own strings/paths/JSON blobs never approach
+// this size (bulk NAR data goes through the separate FramedSource chunked
+// path, not ReadBytes/ReadString). If a length this large is ever seen, it
+// means the stream has desynced and the value is garbage — better to fail
+// the operation with a clear error than to let a corrupted length trigger a
+// multi-gigabyte allocation that gets the whole process OOM-killed.
+const maxReadBytesLength = 64 * 1024 * 1024 // 64 MiB
+
 // ReadBytes reads a length-prefixed byte slice with padding
 func ReadBytes(r io.Reader) ([]byte, error) {
 	length, err := ReadUint64(r)
 	if err != nil {
 		return nil, err
+	}
+	if length > maxReadBytesLength {
+		return nil, fmt.Errorf("refusing to allocate %d bytes for length-prefixed field (max %d) - stream likely desynced", length, maxReadBytesLength)
 	}
 
 	data := make([]byte, length)
@@ -237,11 +249,20 @@ func WriteString(w io.Writer, s string) error {
 	return WriteBytes(w, []byte(s))
 }
 
+// maxReadStringsCount caps the number of elements ReadStrings will preallocate
+// for a single list/set. Same rationale as maxReadBytesLength: a legitimate
+// string list (paths, args, etc.) never approaches this size, so a larger
+// count means the stream has desynced.
+const maxReadStringsCount = 1 << 20 // ~1M entries
+
 // ReadStrings reads a list of strings
 func ReadStrings(r io.Reader) ([]string, error) {
 	count, err := ReadUint64(r)
 	if err != nil {
 		return nil, err
+	}
+	if count > maxReadStringsCount {
+		return nil, fmt.Errorf("refusing to allocate %d string entries (max %d) - stream likely desynced", count, maxReadStringsCount)
 	}
 
 	result := make([]string, count)

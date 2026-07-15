@@ -119,22 +119,28 @@ func (c *Conn) Handshake() error {
 	// 7. For protocol >= 1.14, exchange additional info (affinity, reserve)
 	minor := c.Version & 0xff
 	if minor >= 14 {
-		// Read affinity and reserve space (protocol >= 1.14)
-		// Read CPU affinity (obsolete, ignore)
-		_, err := ReadUint64(c.r)
+		// Read CPU affinity (obsolete, ignore). This field is CONDITIONAL:
+		// the client sends a single uint64 flag, and only if it is non-zero
+		// does a second uint64 (the actual affinity mask) follow - matching
+		// real Nix's `if (readInt(from)) { readInt(from); }`. Always reading
+		// two values here desyncs the entire rest of the session for any
+		// client that actually sets CPU affinity.
+		affinity, err := ReadUint64(c.r)
 		if err != nil {
 			return fmt.Errorf("reading obsolete affinity: %w", err)
 		}
-		// log.Printf("DEBUG: Read affinity: %d", affinity)
+		if affinity != 0 {
+			if _, err := ReadUint64(c.r); err != nil {
+				return fmt.Errorf("reading obsolete affinity mask: %w", err)
+			}
+		}
 
 		// Read reserve space (obsolete, ignore)
 		// Both the Haskell client and the C++ client send reserveSpace as a uint64_t (8 bytes).
 		// This field was previously incorrectly assumed to be a single byte from Haskell.
-		_, err = ReadUint64(c.r)
-		if err != nil {
+		if _, err := ReadUint64(c.r); err != nil {
 			return fmt.Errorf("reading obsolete reserve (uint64): %w", err)
 		}
-		// log.Printf("DEBUG: Read reserveSpace: %d (from uint64)", reserveSpace)
 		// Note: Server does NOT send affinity/reserveSpace back - it proceeds directly to ClientHandshakeInfo
 	}
 
