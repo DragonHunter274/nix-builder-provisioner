@@ -1,0 +1,8 @@
+[package]
+name = "rkyv-fixtures"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
+hex = "0.4"

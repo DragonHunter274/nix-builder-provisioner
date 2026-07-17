@@ -3,6 +3,8 @@ module nix-builder-provisioner
 go 1.24.4
 
 require (
+	github.com/coder/websocket v1.8.15
+	github.com/klauspost/compress v1.19.0
 	golang.org/x/crypto v0.42.0
 	k8s.io/api v0.32.0
 	k8s.io/apimachinery v0.32.0

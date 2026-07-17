@@ -371,7 +371,7 @@ func (p *Proxy) handleQueryValidPaths(conn *Conn) error {
 	storeConn := NewConn(stdout, stdin)
 
 	// Handshake with store
-	if err := p.handshakeWithBuilder(storeConn); err != nil {
+	if err := handshakeWithBuilder(storeConn); err != nil {
 		log.Printf("QueryValidPaths: store handshake failed: %v", err)
 		if err := conn.StopWork(); err != nil {
 			return err
@@ -380,7 +380,7 @@ func (p *Proxy) handleQueryValidPaths(conn *Conn) error {
 	}
 
 	// Send SetOptions
-	if err := p.sendSetOptions(storeConn, conn); err != nil {
+	if err := sendSetOptions(storeConn, clientLogSink(conn)); err != nil {
 		log.Printf("QueryValidPaths: SetOptions failed: %v", err)
 		if err := conn.StopWork(); err != nil {
 			return err
@@ -389,7 +389,7 @@ func (p *Proxy) handleQueryValidPaths(conn *Conn) error {
 	}
 
 	// Step 1: Query which paths are already valid on the store (with substitute=true to let store handle closure)
-	validPaths, err = p.queryValidPathsOnStoreWithSubstitute(storeConn, conn, paths, substitute)
+	validPaths, err = p.queryValidPathsOnStoreWithSubstitute(storeConn, clientLogSink(conn), paths, substitute)
 	if err != nil {
 		log.Printf("QueryValidPaths: querying store failed: %v", err)
 		if err := conn.StopWork(); err != nil {
@@ -428,7 +428,7 @@ func (p *Proxy) handleQueryValidPaths(conn *Conn) error {
 
 // queryValidPathsOnStoreWithSubstitute queries which paths are valid on the store using the nix-daemon protocol
 // If substitute is true, the store will attempt to substitute missing paths from configured substituters
-func (p *Proxy) queryValidPathsOnStoreWithSubstitute(storeConn *Conn, clientConn *Conn, paths []string, substitute bool) ([]string, error) {
+func (p *Proxy) queryValidPathsOnStoreWithSubstitute(storeConn *Conn, sink StderrSink, paths []string, substitute bool) ([]string, error) {
 	if err := storeConn.WriteOp(OpQueryValidPaths); err != nil {
 		return nil, fmt.Errorf("writing op: %w", err)
 	}
@@ -448,7 +448,7 @@ func (p *Proxy) queryValidPathsOnStoreWithSubstitute(storeConn *Conn, clientConn
 		return nil, fmt.Errorf("flushing: %w", err)
 	}
 
-	if err := p.readStderrStream(storeConn, clientConn); err != nil {
+	if err := readStderrStream(storeConn, sink); err != nil {
 		return nil, fmt.Errorf("reading stderr: %w", err)
 	}
 
@@ -650,9 +650,56 @@ func (p *Proxy) handleBuildDerivation(conn *Conn) error {
 	return nil
 }
 
-// executeBuildOnBuilder runs the build on a remote builder via SSH
+// executeBuildOnBuilder runs the build on a remote builder via SSH. Thin
+// adapter over ExecuteBuild that forwards builder logs to the nix-wire
+// client connection that originated this build (the ssh-ng:// path).
 func (p *Proxy) executeBuildOnBuilder(builderSSH *ssh.Client, clientConn *Conn, drvPath string, drv *BasicDerivation, buildMode BuildMode) (*BuildResult, error) {
-	log.Printf("DEBUG executeBuildOnBuilder: drvPath=%s, platform=%s, outputs=%d", drvPath, drv.Platform, len(drv.Outputs))
+	ctx := context.Background()
+	if clientConn != nil {
+		ctx = clientConn.Context()
+	}
+	return ExecuteBuild(ctx, builderSSH, drvPath, drv, buildMode, clientLogSink(clientConn))
+}
+
+// StderrSink receives nix-daemon stderr-stream events (log lines and
+// activity markers) forwarded while a build/operation is in progress on a
+// second (builder- or store-host-facing) connection. *Conn satisfies this
+// directly - forwarding straight through to a nix-wire client - which is
+// how the ssh-ng:// proxy path uses it. Other callers (e.g. a Gradient
+// worker) can implement a partial adapter that only cares about log lines
+// and no-ops the activity methods, since those have no equivalent in
+// Gradient's own protocol.
+type StderrSink interface {
+	WriteStderrLog(msg string) error
+	WriteStderrStartActivity(act, level, type_ uint64, text string, fields []ActivityField, parent uint64) error
+	WriteStderrStopActivity(act uint64) error
+	WriteStderrResult(act, type_ uint64, fields []ActivityField) error
+}
+
+// clientLogSink adapts a nix-wire client connection into the StderrSink
+// used by handshakeWithBuilder/sendSetOptions/readStderrStream/ExecuteBuild.
+// Returns a literal nil StderrSink when conn is nil - never a non-nil
+// interface wrapping a nil *Conn - so `sink != nil` checks downstream stay
+// correct and call sites that don't have a client connection to forward to
+// (e.g. internal store-host operations like signing or AddMultipleToStore)
+// can pass it straight through.
+func clientLogSink(conn *Conn) StderrSink {
+	if conn == nil {
+		return nil
+	}
+	return conn
+}
+
+// ExecuteBuild runs a single BuildDerivation on builderSSH's nix-daemon and
+// returns the BuildResult. It is the protocol-agnostic core shared by the
+// ssh-ng:// proxy path (via executeBuildOnBuilder) and any other caller that
+// wants to drive a build on an already-provisioned builder without speaking
+// the nix-wire protocol itself (e.g. a Gradient worker client) - sink
+// receives stderr-stream events as they arrive; pass nil to discard them.
+// ctx is watched for cancellation: if it's done before the build completes,
+// the builder session is torn down and the build aborted.
+func ExecuteBuild(ctx context.Context, builderSSH *ssh.Client, drvPath string, drv *BasicDerivation, buildMode BuildMode, sink StderrSink) (*BuildResult, error) {
+	log.Printf("DEBUG ExecuteBuild: drvPath=%s, platform=%s, outputs=%d", drvPath, drv.Platform, len(drv.Outputs))
 	// log.Printf("DEBUG: Opening SSH session to builder")
 
 	// Open a session to run nix-daemon --stdio
@@ -672,6 +719,20 @@ func (p *Proxy) executeBuildOnBuilder(builderSSH *ssh.Client, clientConn *Conn, 
 		return nil, fmt.Errorf("getting stdout pipe: %w", err)
 	}
 
+	// Abort the build if the caller's context is cancelled (e.g. client
+	// disconnect on the ssh-ng path, or AbortJob on the Gradient path).
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			log.Printf("ExecuteBuild: context cancelled, aborting build on builder")
+			stdin.Close()
+			session.Close()
+		case <-done:
+		}
+	}()
+
 	// log.Printf("DEBUG: Starting nix-daemon --stdio on builder")
 
 	// Start nix-daemon in stdio mode
@@ -686,14 +747,14 @@ func (p *Proxy) executeBuildOnBuilder(builderSSH *ssh.Client, clientConn *Conn, 
 	builderConn := NewConn(stdout, stdin)
 
 	// Perform handshake with builder
-	if err := p.handshakeWithBuilder(builderConn); err != nil {
+	if err := handshakeWithBuilder(builderConn); err != nil {
 		return nil, fmt.Errorf("builder handshake failed: %w", err)
 	}
 
 	log.Printf("DEBUG: Handshake with builder complete")
 
 	// Send SetOptions first (required before other operations)
-	if err := p.sendSetOptions(builderConn, clientConn); err != nil {
+	if err := sendSetOptions(builderConn, sink); err != nil {
 		return nil, fmt.Errorf("sending options: %w", err)
 	}
 
@@ -727,7 +788,7 @@ func (p *Proxy) executeBuildOnBuilder(builderSSH *ssh.Client, clientConn *Conn, 
 
 	// Read stderr stream and wait for completion
 	// The builder will stream logs, then send STDERR_LAST, then the result
-	if err := p.readStderrStream(builderConn, clientConn); err != nil {
+	if err := readStderrStream(builderConn, sink); err != nil {
 		return nil, fmt.Errorf("reading stderr stream: %w", err)
 	}
 
@@ -776,7 +837,7 @@ func (p *Proxy) executeBuildOnBuilder(builderSSH *ssh.Client, clientConn *Conn, 
 }
 
 // handshakeWithBuilder performs handshake as a client to the builder's nix-daemon
-func (p *Proxy) handshakeWithBuilder(conn *Conn) error {
+func handshakeWithBuilder(conn *Conn) error {
 	// log.Printf("DEBUG: Writing client magic + version to builder")
 
 	// Write client magic and version together
@@ -881,7 +942,7 @@ func (p *Proxy) handshakeWithBuilder(conn *Conn) error {
 }
 
 // sendSetOptions sends the SetOptions operation to initialize the connection
-func (p *Proxy) sendSetOptions(conn *Conn, clientConn *Conn) error {
+func sendSetOptions(conn *Conn, sink StderrSink) error {
 	// log.Printf("DEBUG: Sending SetOptions to builder")
 
 	if err := conn.WriteOp(OpSetOptions); err != nil {
@@ -923,7 +984,7 @@ func (p *Proxy) sendSetOptions(conn *Conn, clientConn *Conn) error {
 	// log.Printf("DEBUG: Waiting for SetOptions response")
 
 	// SetOptions has no response except STDERR_LAST
-	if err := p.readStderrStream(conn, clientConn); err != nil {
+	if err := readStderrStream(conn, sink); err != nil {
 		return err
 	}
 
@@ -932,7 +993,7 @@ func (p *Proxy) sendSetOptions(conn *Conn, clientConn *Conn) error {
 }
 
 // readStderrStream reads stderr messages until STDERR_LAST
-func (p *Proxy) readStderrStream(conn *Conn, clientConn *Conn) error {
+func readStderrStream(conn *Conn, sink StderrSink) error {
 	for {
 		marker, err := ReadUint64(conn.Reader())
 		if err != nil {
@@ -949,9 +1010,9 @@ func (p *Proxy) readStderrStream(conn *Conn, clientConn *Conn) error {
 				return err
 			}
 			log.Printf("[builder] %s", msg)
-			if clientConn != nil {
+			if sink != nil {
 				// Forward log to client
-				if err := clientConn.WriteStderrLog(msg); err != nil {
+				if err := sink.WriteStderrLog(msg); err != nil {
 					log.Printf("Failed to forward log to client: %v", err)
 					// Verify if we should stop here
 				}
@@ -1044,8 +1105,8 @@ func (p *Proxy) readStderrStream(conn *Conn, clientConn *Conn) error {
 				return err
 			}
 
-			if clientConn != nil {
-				clientConn.WriteStderrStartActivity(act, lvl, type_, text, fields, parent)
+			if sink != nil {
+				sink.WriteStderrStartActivity(act, lvl, type_, text, fields, parent)
 			}
 
 		case StderrStopActivity:
@@ -1053,8 +1114,8 @@ func (p *Proxy) readStderrStream(conn *Conn, clientConn *Conn) error {
 			if err != nil {
 				return err
 			}
-			if clientConn != nil {
-				clientConn.WriteStderrStopActivity(act)
+			if sink != nil {
+				sink.WriteStderrStopActivity(act)
 			}
 
 		case StderrResult:
@@ -1089,8 +1150,8 @@ func (p *Proxy) readStderrStream(conn *Conn, clientConn *Conn) error {
 				fields = append(fields, ActivityField{Type: fieldType, IntVal: intVal, StrVal: strVal})
 			}
 
-			if clientConn != nil {
-				clientConn.WriteStderrResult(act, type_, fields)
+			if sink != nil {
+				sink.WriteStderrResult(act, type_, fields)
 			}
 
 		default:
@@ -1276,7 +1337,7 @@ func (p *Proxy) queryRealisation(conn *Conn, drvOutputID string) (*Realisation, 
 	}
 
 	// Read stderr stream
-	if err := p.readStderrStream(conn, nil); err != nil {
+	if err := readStderrStream(conn, nil); err != nil {
 		return nil, fmt.Errorf("reading stderr for QueryRealisation: %w", err)
 	}
 
@@ -1465,12 +1526,12 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 	storeConn := NewConn(stdout, stdin)
 
 	// Perform handshake with store host
-	if err := p.handshakeWithBuilder(storeConn); err != nil {
+	if err := handshakeWithBuilder(storeConn); err != nil {
 		return failWithDrain("store host handshake failed: %v", err)
 	}
 
 	// Send SetOptions first
-	if err := p.sendSetOptions(storeConn, nil); err != nil {
+	if err := sendSetOptions(storeConn, nil); err != nil {
 		return failWithDrain("store host SetOptions failed: %v", err)
 	}
 
@@ -1505,7 +1566,7 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 	readErrCh := make(chan error, 1)
 	go func() {
 		log.Printf("AddMultipleToStore: stderr reader goroutine started")
-		err := p.readStderrStream(storeConn, nil)
+		err := readStderrStream(storeConn, nil)
 		log.Printf("AddMultipleToStore: stderr reader goroutine finished: %v", err)
 		readErrCh <- err
 	}()
@@ -1989,11 +2050,11 @@ func (p *Proxy) signAndRegisterOutputs(result *BuildResult) {
 	}
 
 	storeConn := NewConn(stdout, stdin)
-	if err := p.handshakeWithBuilder(storeConn); err != nil {
+	if err := handshakeWithBuilder(storeConn); err != nil {
 		log.Printf("signing: store handshake failed: %v", err)
 		return
 	}
-	if err := p.sendSetOptions(storeConn, nil); err != nil {
+	if err := sendSetOptions(storeConn, nil); err != nil {
 		log.Printf("signing: SetOptions failed: %v", err)
 		return
 	}
@@ -2041,7 +2102,7 @@ func (p *Proxy) queryPathInfoViaDaemon(storeConn *Conn, path string) (*PathInfo,
 	if err := storeConn.Flush(); err != nil {
 		return nil, err
 	}
-	if err := p.readStderrStream(storeConn, nil); err != nil {
+	if err := readStderrStream(storeConn, nil); err != nil {
 		return nil, err
 	}
 
@@ -2121,7 +2182,7 @@ func (p *Proxy) sendAddSignatures(storeConn *Conn, path string, sigs []string) e
 	if err := storeConn.Flush(); err != nil {
 		return err
 	}
-	return p.readStderrStream(storeConn, nil)
+	return readStderrStream(storeConn, nil)
 }
 
 // collectPeakMemory reads peak memory usage from a builder VM via SSH.

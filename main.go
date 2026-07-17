@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -11,11 +13,12 @@ import (
 	"os/exec"
 	"os/signal"
 	"strconv"
-	"syscall"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"nix-builder-provisioner/gradientproto"
 	"nix-builder-provisioner/metrics"
 	"nix-builder-provisioner/nixproto"
 	"nix-builder-provisioner/provisioner"
@@ -51,6 +54,14 @@ type Config struct {
 	// Signing
 	SigningKeyName string
 	Signer         *nixproto.StoreSigner
+
+	// Gradient worker (see gradientproto/) - registers this proxy as a
+	// native Gradient build worker in addition to the ssh-ng:// path.
+	GradientEnabled             bool
+	GradientServerURL           string
+	GradientPeersFile           string
+	GradientArchitectures       []string
+	GradientMaxConcurrentBuilds uint32
 }
 
 type SSHKeyPair struct {
@@ -248,6 +259,16 @@ func LoadConfig() *Config {
 		K8sImagePullSecret: os.Getenv("K8S_IMAGE_PULL_SECRET"),
 
 		SigningKeyName: getEnvString("SIGNING_KEY_NAME", "nix-builder-proxy-1"),
+
+		GradientEnabled:   os.Getenv("GRADIENT_ENABLED") == "true",
+		GradientServerURL: os.Getenv("GRADIENT_SERVER_URL"),
+		GradientPeersFile: os.Getenv("GRADIENT_PEERS_FILE"),
+		// Defaults to both architectures the hetzner-ubuntu provisioner is
+		// itself configured for by default (HCLOUD_SERVER_TYPE_ARM/_X86) -
+		// override if this deployment only builds one architecture, or
+		// uses a provisioner/config where that default doesn't apply.
+		GradientArchitectures:       getEnvStringSlice("GRADIENT_ARCHITECTURES", []string{"x86_64-linux", "aarch64-linux"}),
+		GradientMaxConcurrentBuilds: uint32(getEnvInt("GRADIENT_MAX_CONCURRENT_BUILDS", 5)),
 	}
 }
 
@@ -272,6 +293,23 @@ func getEnvDuration(k string, d time.Duration) time.Duration {
 		}
 	}
 	return d
+}
+func getEnvStringSlice(k string, d []string) []string {
+	v := os.Getenv(k)
+	if v == "" {
+		return d
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return d
+	}
+	return out
 }
 
 func createProvisioner(config *Config) provisioner.Provisioner {
@@ -364,6 +402,16 @@ func main() {
 	webPort := getEnvString("WEB_PORT", "8080")
 	go startWebServer(pool, metricsDB, webPort)
 
+	var gradientCtx context.Context
+	var gradientCancel context.CancelFunc
+	if config.GradientEnabled {
+		if config.GradientServerURL == "" {
+			log.Fatal("GRADIENT_SERVER_URL is required when GRADIENT_ENABLED=true")
+		}
+		gradientCtx, gradientCancel = context.WithCancel(context.Background())
+		go startGradientWorker(gradientCtx, config, pool, storeKey)
+	}
+
 	listener, err := net.Listen("tcp", ":2222")
 	if err != nil {
 		log.Fatalf("Failed to listen on :2222: %v", err)
@@ -376,6 +424,9 @@ func main() {
 		sig := <-sigChan
 		log.Printf("Received %v, shutting down and destroying all builders...", sig)
 		listener.Close()
+		if gradientCancel != nil {
+			gradientCancel()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 		defer cancel()
 		pool.DestroyAll(ctx)
@@ -449,4 +500,110 @@ func generateOrLoadKeyPair(keyFile string, comment string) (*SSHKeyPair, error) 
 	pub, _ := os.ReadFile(keyFile + ".pub")
 	signer, _ := ssh.ParsePrivateKey(priv)
 	return &SSHKeyPair{PrivateKey: priv, PublicKey: pub, Signer: signer}, nil
+}
+
+// generateOrLoadWorkerID returns this proxy's persistent Gradient worker
+// UUID, generating and persisting a fresh one on first run. Mirrors
+// generateOrLoadKeyPair's generate-if-missing pattern; a stable ID across
+// restarts is what lets the Gradient server recognize a returning worker
+// and matches any peer tokens pre-registered against it (see
+// services.gradient.worker.peersFile / workerId in Gradient's own NixOS
+// module).
+func generateOrLoadWorkerID(path string) string {
+	if data, err := os.ReadFile(path); err == nil {
+		if id := strings.TrimSpace(string(data)); id != "" {
+			return id
+		}
+	}
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		log.Fatalf("generating Gradient worker ID: %v", err)
+	}
+	id := hex.EncodeToString(b[:])
+	if err := os.WriteFile(path, []byte(id+"\n"), 0o600); err != nil {
+		log.Fatalf("persisting Gradient worker ID to %s: %v", path, err)
+	}
+	return id
+}
+
+// startGradientWorker dials the Gradient server and runs the worker
+// session loop with reconnect-with-backoff, blocking until ctx is
+// cancelled. Meant to run in its own goroutine (see main()) alongside the
+// existing ssh-ng:// listener - both share the same *provisioner.Pool, so
+// a build assigned via Gradient draws from the identical builder VMs.
+func startGradientWorker(ctx context.Context, config *Config, pool *provisioner.Pool, storeKey *SSHKeyPair) {
+	workerID := generateOrLoadWorkerID("gradient_worker_id")
+
+	var creds gradientproto.PeerCredentials
+	if config.GradientPeersFile != "" {
+		var err error
+		creds, err = gradientproto.LoadPeersFile(config.GradientPeersFile)
+		if err != nil {
+			log.Fatalf("loading GRADIENT_PEERS_FILE: %v", err)
+		}
+	}
+
+	storeSSHConfig := &ssh.ClientConfig{
+		User:            config.StoreHostUser,
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(storeKey.Signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         15 * time.Second,
+	}
+	storeAddr := fmt.Sprintf("%s:%d", config.StoreHostIP, config.StoreHostSSHPort)
+
+	executor := gradientproto.NewExecutor(pool, nil, nil)
+	client := gradientproto.NewClient(gradientproto.ClientConfig{
+		ServerURL:           config.GradientServerURL,
+		PeerID:              workerID,
+		Credentials:         creds,
+		Architectures:       config.GradientArchitectures,
+		MaxConcurrentBuilds: config.GradientMaxConcurrentBuilds,
+	}, executor.HandleJob)
+
+	const (
+		minBackoff        = time.Second
+		maxBackoff        = time.Minute
+		healthySessionMin = 30 * time.Second // see backoff reset comment below
+	)
+	backoff := minBackoff
+	for {
+		// Dial the store host fresh for each session - a single
+		// long-lived SSH connection held across reconnects/hours of
+		// uptime is more failure-prone (idle timeouts, NAT rebinding)
+		// than redialing alongside the WebSocket session it serves.
+		storeConn, err := ssh.Dial("tcp", storeAddr, storeSSHConfig)
+		if err != nil {
+			log.Printf("gradient worker: connecting to store host: %v", err)
+		} else {
+			executor.SetStoreHostExec(gradientproto.NewSSHExecer(storeConn))
+			log.Printf("gradient worker: connecting to %s as %s", config.GradientServerURL, workerID)
+			start := time.Now()
+			err = client.Run(ctx)
+			storeConn.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			log.Printf("gradient worker: session ended: %v", err)
+			// Only reset backoff after a session that actually stayed up
+			// for a while - a server that rejects every connection
+			// attempt instantly (bad credentials, incompatible protocol
+			// version) would otherwise have this loop hammer it at
+			// minBackoff forever instead of backing off.
+			if time.Since(start) >= healthySessionMin {
+				backoff = minBackoff
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+		if backoff < maxBackoff {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+	}
 }
