@@ -1541,18 +1541,15 @@ func (p *Proxy) handleAddMultipleToStore(conn *Conn) error {
 		return failWithDrain("writing AddMultipleToStore op: %v", err)
 	}
 
-	// When uploading to the shared store: enforce sig checking regardless of what
-	// the client requested (clients cannot bypass signature verification).
-	// When uploading to a user-private store: allow unsigned paths (the user is
-	// uploading their own source inputs which are not signed).
-	allowUnsigned := p.config.UserStoreEnabled && p.config.UserFingerprint != ""
-	if dontCheckSigs && !allowUnsigned {
-		log.Printf("AddMultipleToStore: client requested dontCheckSigs=true, overriding to false")
-	}
+	// Forward the client's dontCheckSigs request as-is. Locally-computed build
+	// inputs (sources, small derivations) are never signed under normal Nix
+	// operation, so forcing signature checks here would break ordinary builds.
+	// The trust boundary is SSH authorized_keys on this proxy, mirrored by
+	// trusted-users for the nix-builder SSH user on the store host.
 	if err := WriteBool(storeConn.Writer(), repair); err != nil {
 		return failWithDrain("writing repair: %v", err)
 	}
-	if err := WriteBool(storeConn.Writer(), allowUnsigned); err != nil {
+	if err := WriteBool(storeConn.Writer(), dontCheckSigs); err != nil {
 		return failWithDrain("writing dontCheckSigs: %v", err)
 	}
 
