@@ -15,6 +15,7 @@ COPY main.go webui.go ./
 COPY metrics/ ./metrics/
 COPY nixproto/ ./nixproto/
 COPY provisioner/ ./provisioner/
+COPY gradientproto/ ./gradientproto/
 COPY webui/dist/ ./webui/dist/
 
 # Build the binary
